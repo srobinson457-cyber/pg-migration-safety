@@ -1,0 +1,33 @@
+# This repo runs its own gate against its own examples, on every push.
+#
+# The demo:unsafe step is expected to FAIL, so it is inverted: if the scanner
+# ever stops flagging the deliberately destructive example, that is the
+# regression worth failing the build over.
+name: self-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Self-test suite
+        run: node src/check-migration-safety.mjs --self-test
+
+      - name: Safe example must pass
+        run: node src/check-migration-safety.mjs examples/20260101000000_safe_additive.sql
+
+      - name: Destructive example must be caught
+        run: |
+          if node src/check-migration-safety.mjs examples/20260101000001_destructive.sql; then
+            echo "REGRESSION: the destructive example was not flagged."
+            exit 1
+          fi
+          echo "Destructive example correctly flagged."

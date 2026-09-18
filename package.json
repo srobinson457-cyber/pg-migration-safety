@@ -1,0 +1,38 @@
+{
+  "name": "pg-migration-safety",
+  "version": "1.0.0",
+  "description": "CI gate that catches destructive SQL migrations a from-empty test replay cannot see. Zero dependencies.",
+  "type": "module",
+  "main": "src/check-migration-safety.mjs",
+  "exports": {
+    ".": "./src/check-migration-safety.mjs"
+  },
+  "bin": {
+    "pg-migration-safety": "src/check-migration-safety.mjs"
+  },
+  "scripts": {
+    "test": "node src/check-migration-safety.mjs --self-test",
+    "demo:safe": "node src/check-migration-safety.mjs examples/20260101000000_safe_additive.sql",
+    "demo:unsafe": "node src/check-migration-safety.mjs examples/20260101000001_destructive.sql"
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "migrations",
+    "ci",
+    "database",
+    "safety",
+    "sql",
+    "lint"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "src",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ]
+}
