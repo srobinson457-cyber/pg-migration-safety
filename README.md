@@ -2,7 +2,7 @@
 
 A CI gate that catches destructive SQL migrations **your migration tests cannot see**.
 
-Zero dependencies. One file. 24 self-tests.
+Zero dependencies. One file. 28 self-tests.
 
 ```bash
 node src/check-migration-safety.mjs migrations/*.sql
@@ -84,9 +84,14 @@ update public.accounts set updated_at = now() where id = $1;
 
 -- must flag: the ) closes the CTE wrapper, and there is no WHERE
 with d as (delete from public.sessions) select 1;
+
+-- must flag: the only WHERE belongs to the subquery, so every row is updated
+update public.accounts set tier = (select tier from public.plans where id = 1);
 ```
 
-The scan walks balanced pairs and stops only at a `)` that closes an *enclosing* group.
+The scan walks balanced pairs and stops only at a `)` that closes an *enclosing* group. Within
+that span, only a `WHERE` at the top level counts; a `WHERE` nested inside a subquery is the
+subquery's, not the statement's.
 
 **Comments are stripped first**, so a comment mentioning `DROP TABLE` cannot false-flag, while a
 `DROP TABLE` inside a string literal still does.
@@ -149,10 +154,13 @@ const findings = scanSql(sqlText);   // => array of rule names, deduped
 if (findings.length) { /* ... */ }
 ```
 
+Importing has no side effects. The CLI runs only when the file is the entry point, so it never
+calls `process.exit` inside your process.
+
 **Try it.**
 
 ```bash
-npm run test          # 24 self-test cases
+npm run test          # 28 self-test cases
 npm run demo:safe     # exits 0
 npm run demo:unsafe   # exits 1, lists six findings
 ```
