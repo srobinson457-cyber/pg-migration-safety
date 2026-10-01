@@ -4,6 +4,8 @@ A CI gate that catches destructive SQL migrations **your migration tests cannot 
 
 Zero dependencies. One file. 28 self-tests.
 
+Extracted in September 2026 from private code I wrote and run in production; the history stays private because it contains private data.
+
 ```bash
 node src/check-migration-safety.mjs migrations/*.sql
 ```
