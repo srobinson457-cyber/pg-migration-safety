@@ -5,7 +5,9 @@ A CI gate that catches destructive SQL migrations **your migration tests cannot 
 Zero dependencies. One file. 44 self-tests, and a mutation check that removes each rule in turn
 and requires a test to fail.
 
-Extracted in September 2026 from private code I run in production, built agent-first with Claude Code; the history stays private because it contains private data.
+Extracted in September 2026 from private code I run in production, built agent-first with Claude
+Code; the history stays private because it contains private data. How I build and check code:
+[REVIEWING.md](https://github.com/srobinson457-cyber/srobinson457-cyber/blob/main/REVIEWING.md).
 
 ```bash
 node src/check-migration-safety.mjs migrations/*.sql
