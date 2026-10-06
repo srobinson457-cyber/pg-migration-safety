@@ -1,0 +1,10 @@
+{
+  "examples/20260101000001_destructive.sql": [
+    "ADD COLUMN ... NOT NULL without DEFAULT (fails on existing rows)",
+    "ALTER COLUMN ... TYPE (table rewrite)",
+    "DROP TABLE",
+    "RENAME column/constraint/table (breaks live clients)",
+    "non-CONCURRENT CREATE INDEX on existing table \"accounts\" (locks prod)",
+    "unqualified DELETE (no WHERE)"
+  ]
+}

@@ -2,7 +2,8 @@
 
 A CI gate that catches destructive SQL migrations **your migration tests cannot see**.
 
-Zero dependencies. One file. 28 self-tests.
+Zero dependencies. One file. 42 self-tests, and a mutation check that removes each rule in turn
+and requires a test to fail.
 
 Extracted in September 2026 from private code I run in production, built agent-first with Claude Code; the history stays private because it contains private data.
 
@@ -47,7 +48,7 @@ kind of check, applied to the SQL text itself.
 | `DELETE` / `UPDATE` with no `WHERE` | Destroys or rewrites the whole table |
 | `DROP TABLE` / `DROP COLUMN` | Irreversible data loss |
 | `TRUNCATE` | Same, and it does not fire row triggers |
-| `ALTER COLUMN ... TYPE` | Full table rewrite under an exclusive lock |
+| `ALTER [COLUMN] ... [SET DATA] TYPE` | Full table rewrite under an exclusive lock |
 | `RENAME` column / constraint / table | Breaks deployed clients still using the old name |
 | `ADD COLUMN ... NOT NULL` without `DEFAULT` | Fails outright on a table with existing rows |
 | Non-`CONCURRENT` `CREATE INDEX` on a pre-existing table | Blocks writes for the duration of the build |
@@ -95,8 +96,9 @@ The scan walks balanced pairs and stops only at a `)` that closes an *enclosing*
 that span, only a `WHERE` at the top level counts; a `WHERE` nested inside a subquery is the
 subquery's, not the statement's.
 
-**Comments are stripped first**, so a comment mentioning `DROP TABLE` cannot false-flag, while a
-`DROP TABLE` inside a string literal still does.
+**Comments are stripped first**, inside `scanSql` itself, so a comment mentioning `DROP TABLE`
+cannot false-flag and a `where` in a comment cannot satisfy the `WHERE` check, while a
+`DROP TABLE` inside a string literal still flags.
 
 ---
 
@@ -147,13 +149,21 @@ jobs:
 Running `--self-test` before the gate is not ceremony. A gate whose own logic has silently
 regressed is worse than no gate, because you will trust it.
 
+Each self-test case asserts the exact rule names it expects, and `scripts/mutation-check.mjs`
+deletes or breaks each rule in turn and requires the self-test to fail. A rule that could be
+removed without a failing test is a rule nobody is guarding.
+
+Pass `--json` to get `{"<file>": [sorted rule names]}` on stdout instead of text, with the same
+exit codes. This repo's CI diffs that output for the destructive example against
+`examples/20260101000001_destructive.expected.json`.
+
 **As a library.**
 
 ```js
 import { scanSql } from './src/check-migration-safety.mjs';
 
-const findings = scanSql(sqlText);   // => array of rule names, deduped
-if (findings.length) { /* ... */ }
+const findings = scanSql(sqlText);   // raw file contents; comments are stripped for you
+if (findings.length) { /* ... */ }   // => array of rule names, deduped
 ```
 
 Importing has no side effects. The CLI runs only when the file is the entry point, so it never
@@ -162,7 +172,8 @@ calls `process.exit` inside your process.
 **Try it.**
 
 ```bash
-npm run test          # 28 self-test cases
+npm run test          # 42 self-test cases
+npm run test:mutation # breaks each rule in turn; every break must fail the self-test
 npm run demo:safe     # exits 0
 npm run demo:unsafe   # exits 1, lists six findings
 ```

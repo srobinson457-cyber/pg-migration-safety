@@ -2,7 +2,8 @@
 #
 # The demo:unsafe step is expected to FAIL, so it is inverted: if the scanner
 # ever stops flagging the deliberately destructive example, that is the
-# regression worth failing the build over.
+# regression worth failing the build over. It also diffs the exact rule names
+# against a checked-in list, so losing one rule fails even while others fire.
 name: self-test
 
 on:
@@ -21,13 +22,23 @@ jobs:
       - name: Self-test suite
         run: node src/check-migration-safety.mjs --self-test
 
+      - name: Mutation check (every broken rule must fail the self-test)
+        run: node scripts/mutation-check.mjs
+
       - name: Safe example must pass
         run: node src/check-migration-safety.mjs examples/20260101000000_safe_additive.sql
 
-      - name: Destructive example must be caught
+      - name: Destructive example must be caught by exactly the expected rules
         run: |
-          if node src/check-migration-safety.mjs examples/20260101000001_destructive.sql; then
-            echo "REGRESSION: the destructive example was not flagged."
+          status=0
+          node src/check-migration-safety.mjs --json examples/20260101000001_destructive.sql > "$RUNNER_TEMP/destructive.json" || status=$?
+          cat "$RUNNER_TEMP/destructive.json"
+          if [ "$status" -ne 1 ]; then
+            echo "REGRESSION: the destructive example exited $status, expected 1."
             exit 1
           fi
-          echo "Destructive example correctly flagged."
+          if ! diff --strip-trailing-cr -u examples/20260101000001_destructive.expected.json "$RUNNER_TEMP/destructive.json"; then
+            echo "REGRESSION: the destructive example's findings differ from the expected list."
+            exit 1
+          fi
+          echo "Destructive example correctly flagged by all expected rules."
