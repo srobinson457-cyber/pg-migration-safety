@@ -76,8 +76,12 @@ const MUTANTS = [
     'if (!created.has(tbl)) {', 'if (true) {'],
   ['ALTER ... TYPE: require the COLUMN keyword',
     '|\\balter\\s+(?:"[^"]+"|[a-z0-9_]+)\\s+(?:set\\s+data\\s+)?type\\b', ''],
+  ['ALTER ... TYPE without COLUMN: no quoted column name',
+    '|\\balter\\s+(?:"[^"]+"|[a-z0-9_]+)', '|\\balter\\s+(?:[a-z0-9_]+)'],
   ['UPDATE: no alias allowed before SET',
     '(?:\\s+(?:as\\s+)?[a-z0-9_"]+)?\\s+set\\b', '\\s+set\\b'],
+  ['UPDATE: no quoted alias',
+    '(?:as\\s+)?[a-z0-9_"]+)?', '(?:as\\s+)?[a-z0-9_]+)?'],
   ['scanSql: do not strip comments',
     'const sql = stripComments(rawSql);', 'const sql = rawSql;'],
 ];

@@ -218,6 +218,7 @@ const SELF_TEST_CASES = [
   ['UPDATE with a subquery value and its own WHERE', `update a set b = (select c from d where e = 1) where id = 2`, []],
   ['UPDATE with a table alias, no WHERE', `update public.accounts a set tier = 1`, [UPD]],
   ['UPDATE with an AS alias, no WHERE', `update public.accounts as a set tier = 1`, [UPD]],
+  ['UPDATE with a quoted alias, no WHERE', `update public.accounts "A" set tier = 1`, [UPD]],
   ['UPDATE with a table alias and WHERE', `update public.accounts a set tier = 1 where a.id = 2`, []],
   ['DELETE whose only "where" is in a trailing comment', `delete from public.audit_log -- purge everything where possible`, [DEL]],
   ['DELETE whose only WHERE is inside a USING subquery', `delete from a using (select id from b where x = 1) s`, [DEL]],
@@ -246,6 +247,7 @@ const SELF_TEST_CASES = [
   ['ALTER COLUMN TYPE', `alter table families alter column id type bigint`, [ALTER_TYPE]],
   ['ALTER ... TYPE without the optional COLUMN keyword', `alter table public.accounts alter amount_cents type bigint`, [ALTER_TYPE]],
   ['ALTER ... SET DATA TYPE without COLUMN', `alter table public.accounts alter amount_cents set data type bigint`, [ALTER_TYPE]],
+  ['ALTER ... TYPE on a quoted column without COLUMN', `alter table public.accounts alter "Amount" type bigint`, [ALTER_TYPE]],
   ['TRUNCATE inside DO block', `do $$ begin truncate public.stars; end $$`, ['TRUNCATE']],
 ];
 
