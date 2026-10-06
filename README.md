@@ -150,8 +150,8 @@ Running `--self-test` before the gate is not ceremony. A gate whose own logic ha
 regressed is worse than no gate, because you will trust it.
 
 Each self-test case asserts the exact rule names it expects, and `scripts/mutation-check.mjs`
-deletes or breaks each rule in turn and requires the self-test to fail. A rule that could be
-removed without a failing test is a rule nobody is guarding.
+deletes or breaks each rule in turn and requires a self-test case to fail. A rule that could
+be removed without a failing test is a rule nobody is guarding.
 
 Pass `--json` to get `{"<file>": [sorted rule names]}` on stdout instead of text, with the same
 exit codes. This repo's CI diffs that output for the destructive example against

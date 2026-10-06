@@ -6,10 +6,16 @@
 // The self-test must FAIL on every mutant. A mutant that passes ("survives")
 // means a rule could be deleted or broken without any test noticing.
 //
+// A mutant counts as killed only when the self-test exits 1 AND prints its
+// "N/M case(s) FAILED" summary, meaning a test case caught it. Any other exit
+// (a syntax error from a mutant that broke the file, a crash) proves nothing
+// about the tests, so it is reported as a problem rather than a kill.
+//
 //   Usage:  node scripts/mutation-check.mjs
-//   exit 0  -> every mutant was killed
-//   exit 1  -> a mutant survived, a mutant no longer applies, or the
-//              unmutated scanner fails its own self-test
+//   exit 0  -> every mutant was killed by a failing self-test case
+//   exit 1  -> a mutant survived, a mutant no longer applies, a mutant broke
+//              the self-test without failing a case, or the unmutated
+//              scanner fails its own self-test
 //
 // No dependencies.
 
@@ -76,6 +82,9 @@ const MUTANTS = [
     'const sql = stripComments(rawSql);', 'const sql = rawSql;'],
 ];
 
+// The summary line the self-test prints to stderr when any case fails.
+const SELF_TEST_FAILED = /^check-migration-safety --self-test: \d+\/\d+ case\(s\) FAILED$/m;
+
 const countOf = (haystack, needle) => haystack.split(needle).length - 1;
 
 const runSelfTest = (dir, text) => {
@@ -84,36 +93,47 @@ const runSelfTest = (dir, text) => {
   return spawnSync(process.execPath, [file, '--self-test'], { encoding: 'utf8' });
 };
 
+// First line of stderr that names an error (e.g. "SyntaxError: ..."), for the report.
+const errorLine = (stderr) =>
+  (stderr || '').split('\n').find((l) => /^\w*Error\b/.test(l)) || '(no error line on stderr)';
+
 const dir = mkdtempSync(join(tmpdir(), 'pg-migration-safety-mutants-'));
+let baselineFails = false;
 let problems = 0;
 try {
   // A self-test that already fails would "kill" every mutant and prove nothing.
   const base = runSelfTest(dir, source);
-  if (base.status !== 0) {
+  baselineFails = base.status !== 0;
+  if (baselineFails) {
     console.error('mutation-check: the unmutated scanner fails its own self-test:');
     console.error((base.stdout || '') + (base.stderr || ''));
-    process.exit(1);
-  }
-
-  for (const [desc, find, replace] of MUTANTS) {
-    const n = countOf(source, find);
-    if (n !== 1) {
-      problems++;
-      console.error(`  DID NOT APPLY (${n} matches): ${desc}`);
-      continue;
-    }
-    const r = runSelfTest(dir, source.replace(find, () => replace));
-    if (r.status === 0) {
-      problems++;
-      console.error(`  SURVIVED: ${desc}`);
-    } else {
-      console.log(`  killed: ${desc}`);
+  } else {
+    for (const [desc, find, replace] of MUTANTS) {
+      const n = countOf(source, find);
+      if (n !== 1) {
+        problems++;
+        console.error(`  DID NOT APPLY (${n} matches): ${desc}`);
+        continue;
+      }
+      const r = runSelfTest(dir, source.replace(find, () => replace));
+      if (r.status === 0) {
+        problems++;
+        console.error(`  SURVIVED: ${desc}`);
+      } else if (r.status === 1 && SELF_TEST_FAILED.test(r.stderr || '')) {
+        console.log(`  killed: ${desc}`);
+      } else {
+        // Not a kill: the self-test reported no failing case, so this proves nothing.
+        problems++;
+        console.error(`  NO FAILING CASE (exit ${r.status ?? r.signal}): ${desc}: ${errorLine(r.stderr)}`);
+      }
     }
   }
 } finally {
+  // Runs on every path, including a failing baseline, so the temp dir never leaks.
   rmSync(dir, { recursive: true, force: true });
 }
 
+if (baselineFails) process.exit(1);
 if (problems) {
   console.error(`mutation-check: ${problems}/${MUTANTS.length} mutant(s) not killed`);
   process.exit(1);
