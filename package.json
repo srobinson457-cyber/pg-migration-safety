@@ -12,6 +12,7 @@
   },
   "scripts": {
     "test": "node src/check-migration-safety.mjs --self-test",
+    "test:mutation": "node scripts/mutation-check.mjs",
     "demo:safe": "node src/check-migration-safety.mjs examples/20260101000000_safe_additive.sql",
     "demo:unsafe": "node src/check-migration-safety.mjs examples/20260101000001_destructive.sql"
   },

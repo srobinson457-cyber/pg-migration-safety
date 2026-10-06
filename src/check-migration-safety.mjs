@@ -21,11 +21,14 @@
 // migration) pass clean.
 //
 //   Usage:  node check-migration-safety.mjs <file1.sql> [file2.sql ...]
+//           node check-migration-safety.mjs --json <file1.sql> [...]
 //           node check-migration-safety.mjs --self-test
+//   --json  -> print {"<file>": [sorted rule names]} instead of text; same exit codes
 //   exit 0  -> all clean, or no .sql files given
 //   exit 1  -> at least one destructive/risky pattern (route to human)
 //
 // Also importable: `import { scanSql } from './check-migration-safety.mjs'`.
+// scanSql takes raw SQL text and strips comments itself.
 // Importing has no side effects: the CLI below runs only when this file is
 // the entry point, so it never calls process.exit inside your process.
 //
@@ -67,7 +70,8 @@ const STMT_RULES = [
   ['DROP CONSTRAINT', /\bdrop\s+constraint\b/i],
   ['RENAME column/constraint/table (breaks live clients)', /\brename\s+(?:column|constraint|to)\b/i],
   ['TRUNCATE', /\btruncate\b/i],
-  ['ALTER COLUMN ... TYPE (table rewrite)', /\balter\s+column\b[\s\S]*?\btype\b/i],
+  // COLUMN is optional in Postgres: ALTER [ COLUMN ] name [ SET DATA ] TYPE.
+  ['ALTER COLUMN ... TYPE (table rewrite)', /\balter\s+column\b[\s\S]*?\btype\b|\balter\s+(?:"[^"]+"|[a-z0-9_]+)\s+(?:set\s+data\s+)?type\b/i],
   ['SET NOT NULL (can fail/lock on existing rows)', /\bset\s+not\s+null\b/i],
 ];
 
@@ -102,8 +106,10 @@ const hasTopLevelWhere = (span) => {
   return /\bwhere\b/i.test(top);
 };
 
-// Scan one comment-stripped SQL text; returns finding names (deduped).
-export const scanSql = (sql) => {
+// Scan one SQL text (raw file contents are fine); returns finding names (deduped).
+// Comments are stripped here so library callers get the same result as the CLI.
+export const scanSql = (rawSql) => {
+  const sql = stripComments(rawSql);
   const findings = new Set();
 
   // Tables created in THIS migration: an index/constraint on one of them is safe
@@ -163,7 +169,8 @@ export const scanSql = (sql) => {
         findings.add('unqualified DELETE (no WHERE)');
       }
     }
-    const updRe = /\bupdate\s+(?:only\s+)?[a-z0-9_."]+\s+set\b/gi;
+    // The table may carry an alias, with or without AS, before SET.
+    const updRe = /\bupdate\s+(?:only\s+)?[a-z0-9_."]+(?:\s+(?:as\s+)?[a-z0-9_"]+)?\s+set\b/gi;
     for (let m; (m = updRe.exec(s)); ) {
       if (!hasTopLevelWhere(groupSpan(s, m.index))) {
         findings.add('unqualified UPDATE (no WHERE)');
@@ -185,36 +192,63 @@ export const scanSql = (sql) => {
 // ---------------------------------------------------------------------------
 // Self-test: `node src/check-migration-safety.mjs --self-test`
 // Run by CI before the gate so a regression in the gate itself cannot merge.
+// scripts/mutation-check.mjs breaks each rule in turn and requires this
+// self-test to fail, so every rule needs a case that names it.
 // ---------------------------------------------------------------------------
+// Rule names exactly as scanSql reports them. Spelled out here rather than
+// shared with the rules above, so renaming a rule also fails the self-test.
+const DEL = 'unqualified DELETE (no WHERE)';
+const UPD = 'unqualified UPDATE (no WHERE)';
+const DROP_POLICY = 'DROP POLICY without same-file recreate (RLS gap / permission loss)';
+const RENAME = 'RENAME column/constraint/table (breaks live clients)';
+const ADD_NOT_NULL = 'ADD COLUMN ... NOT NULL without DEFAULT (fails on existing rows)';
+const ALTER_TYPE = 'ALTER COLUMN ... TYPE (table rewrite)';
+
 const SELF_TEST_CASES = [
-  // [description, sql, expected finding-count > 0]
-  ['DELETE without WHERE inside DO block', `do $$ begin if true then delete from public.stars; end if; end $$`, true],
-  ['DELETE with WHERE inside DO block', `do $$ begin delete from stars where family_id = fid; end $$`, false],
-  ['DELETE without WHERE inside CTE', `with dead as (delete from stars returning id) select count(*) from dead`, true],
-  ['DELETE with WHERE inside CTE', `with dead as (delete from stars where created_at < now() - interval '30 days') select 1`, false],
-  ['UPDATE with function-call value and WHERE', `update families set updated_at = now() where id = '1'`, false],
-  ['UPDATE without WHERE', `update families set premium_override = false`, true],
-  ['UPDATE without WHERE inside DO block', `do $$ begin update families set x = 1; end $$`, true],
-  ['UPDATE whose only WHERE is inside a subquery value', `update a set b = (select c from d where e = 1)`, true],
-  ['UPDATE with a subquery value and its own WHERE', `update a set b = (select c from d where e = 1) where id = 2`, false],
-  ['DELETE whose only WHERE is inside a USING subquery', `delete from a using (select id from b where x = 1) s`, true],
-  ['EXECUTE format dynamic DELETE without WHERE', `do $$ begin execute format('delete from %I', t); end $$`, true],
-  ['naked DROP POLICY (no recreate)', `drop policy "families_select" on public.families`, true],
-  ['DROP POLICY + same-file recreate (single-txn, no gap)', `drop policy "families_select" on public.families;\ncreate policy "families_select" on public.families for select using (family_id = get_user_family_id())`, false],
-  ['DROP POLICY recreated under a DIFFERENT name', `drop policy "families_select" on public.families;\ncreate policy "families_read" on public.families for select using (true)`, true],
-  ['DROP POLICY IF EXISTS + recreate', `drop policy if exists families_select on families;\ncreate policy families_select on families for select using (true)`, false],
-  ['DROP CONSTRAINT', `alter table families drop constraint families_pkey`, true],
-  ['RENAME COLUMN', `alter table families rename column name to family_name`, true],
-  ['RENAME TO (table rename)', `alter table families rename to households`, true],
-  ['ADD COLUMN NOT NULL without DEFAULT', `alter table families add column tier text not null`, true],
-  ['ADD COLUMN NOT NULL with DEFAULT', `alter table families add column tier text not null default 'free'`, false],
-  ['ADD COLUMN nullable', `alter table families add column note text`, false],
-  ['DROP TABLE mentioned only in a comment', `-- we deliberately do NOT drop table stars\ncreate table foo (id uuid primary key)`, false],
-  ['plain additive migration', `create table foo (id uuid primary key);\ncreate index foo_idx on foo (id);\ncreate policy p on foo for select using (true)`, false],
-  ['non-concurrent index on pre-existing table', `create index stars_idx on public.stars (family_id)`, true],
-  ['SET NOT NULL', `alter table families alter column name set not null`, true],
-  ['ALTER COLUMN TYPE', `alter table families alter column id type bigint`, true],
-  ['TRUNCATE inside DO block', `do $$ begin truncate public.stars; end $$`, true],
+  // [description, sql, exact rule names expected ([] means clean)]
+  ['DELETE without WHERE inside DO block', `do $$ begin if true then delete from public.stars; end if; end $$`, [DEL]],
+  ['DELETE with WHERE inside DO block', `do $$ begin delete from stars where family_id = fid; end $$`, []],
+  ['DELETE without WHERE inside CTE', `with dead as (delete from stars returning id) select count(*) from dead`, [DEL]],
+  ['DELETE without WHERE inside CTE, outer query has a WHERE', `with d as (delete from public.sessions returning id) select * from d where id > 0`, [DEL]],
+  ['DELETE with WHERE inside CTE', `with dead as (delete from stars where created_at < now() - interval '30 days') select 1`, []],
+  ['UPDATE with function-call value and WHERE', `update families set updated_at = now() where id = '1'`, []],
+  ['UPDATE without WHERE', `update families set premium_override = false`, [UPD]],
+  ['UPDATE without WHERE inside DO block', `do $$ begin update families set x = 1; end $$`, [UPD]],
+  ['UPDATE whose only WHERE is inside a subquery value', `update a set b = (select c from d where e = 1)`, [UPD]],
+  ['UPDATE with a subquery value and its own WHERE', `update a set b = (select c from d where e = 1) where id = 2`, []],
+  ['UPDATE with a table alias, no WHERE', `update public.accounts a set tier = 1`, [UPD]],
+  ['UPDATE with an AS alias, no WHERE', `update public.accounts as a set tier = 1`, [UPD]],
+  ['UPDATE with a quoted alias, no WHERE', `update public.accounts "A" set tier = 1`, [UPD]],
+  ['UPDATE with a table alias and WHERE', `update public.accounts a set tier = 1 where a.id = 2`, []],
+  ['DELETE whose only "where" is in a trailing comment', `delete from public.audit_log -- purge everything where possible`, [DEL]],
+  ['DELETE whose only WHERE is inside a USING subquery', `delete from a using (select id from b where x = 1) s`, [DEL]],
+  ['EXECUTE format dynamic DELETE without WHERE', `do $$ begin execute format('delete from %I', t); end $$`, [DEL]],
+  ['naked DROP POLICY (no recreate)', `drop policy "families_select" on public.families`, [DROP_POLICY]],
+  ['DROP POLICY + same-file recreate (single-txn, no gap)', `drop policy "families_select" on public.families;\ncreate policy "families_select" on public.families for select using (family_id = get_user_family_id())`, []],
+  ['DROP POLICY recreated under a DIFFERENT name', `drop policy "families_select" on public.families;\ncreate policy "families_read" on public.families for select using (true)`, [DROP_POLICY]],
+  ['DROP POLICY IF EXISTS + recreate', `drop policy if exists families_select on families;\ncreate policy families_select on families for select using (true)`, []],
+  ['DROP POLICY in a form the parser does not recognize', `drop policy families_select`, ['DROP POLICY (unrecognized form)']],
+  ['DROP TABLE', `drop table public.legacy_imports`, ['DROP TABLE']],
+  ['DROP SCHEMA', `drop schema reporting cascade`, ['DROP SCHEMA']],
+  ['DROP DATABASE', `drop database analytics`, ['DROP DATABASE']],
+  ['DROP COLUMN', `alter table families drop column legacy_code`, ['DROP COLUMN']],
+  ['DROP CONSTRAINT', `alter table families drop constraint families_pkey`, ['DROP CONSTRAINT']],
+  ['RENAME COLUMN', `alter table families rename column name to family_name`, [RENAME]],
+  ['RENAME TO (table rename)', `alter table families rename to households`, [RENAME]],
+  ['ADD COLUMN NOT NULL without DEFAULT', `alter table families add column tier text not null`, [ADD_NOT_NULL]],
+  ['ADD COLUMN NOT NULL with DEFAULT', `alter table families add column tier text not null default 'free'`, []],
+  ['ADD COLUMN nullable', `alter table families add column note text`, []],
+  ['DROP TABLE mentioned only in a line comment', `-- we deliberately do NOT drop table stars\ncreate table foo (id uuid primary key)`, []],
+  ['DROP TABLE mentioned only in a block comment', `/* drop table public.accounts was considered and rejected */\ncreate table foo (id uuid primary key)`, []],
+  ['plain additive migration', `create table foo (id uuid primary key);\ncreate index foo_idx on foo (id);\ncreate policy p on foo for select using (true)`, []],
+  ['non-concurrent index on pre-existing table', `create index stars_idx on public.stars (family_id)`, ['non-CONCURRENT CREATE INDEX on existing table "stars" (locks prod)']],
+  ['CONCURRENT index on pre-existing table', `create index concurrently i on public.existing (c)`, []],
+  ['SET NOT NULL', `alter table families alter column name set not null`, ['SET NOT NULL (can fail/lock on existing rows)']],
+  ['ALTER COLUMN TYPE', `alter table families alter column id type bigint`, [ALTER_TYPE]],
+  ['ALTER ... TYPE without the optional COLUMN keyword', `alter table public.accounts alter amount_cents type bigint`, [ALTER_TYPE]],
+  ['ALTER ... SET DATA TYPE without COLUMN', `alter table public.accounts alter amount_cents set data type bigint`, [ALTER_TYPE]],
+  ['ALTER ... TYPE on a quoted column without COLUMN', `alter table public.accounts alter "Amount" type bigint`, [ALTER_TYPE]],
+  ['TRUNCATE inside DO block', `do $$ begin truncate public.stars; end $$`, ['TRUNCATE']],
 ];
 
 // Importing the module must not run the CLI. A fresh Node process imports it
@@ -232,12 +266,14 @@ const checkImportHasNoSideEffects = () => {
 const runSelfTest = () => {
   const total = SELF_TEST_CASES.length + 1;
   let failed = 0;
-  for (const [desc, sql, shouldFlag] of SELF_TEST_CASES) {
-    const found = scanSql(stripComments(sql));
-    const flagged = found.length > 0;
-    if (flagged !== shouldFlag) {
+  const show = (names) => (names.length ? names.join('; ') : 'clean');
+  for (const [desc, sql, expectedNames] of SELF_TEST_CASES) {
+    // Raw text on purpose: this is the documented library call.
+    const found = [...scanSql(sql)].sort();
+    const expected = [...expectedNames].sort();
+    if (found.join('\n') !== expected.join('\n')) {
       failed++;
-      console.error(`  FAIL: ${desc}: expected ${shouldFlag ? 'flagged' : 'clean'}, got ${flagged ? `flagged (${found.join('; ')})` : 'clean'}`);
+      console.error(`  FAIL: ${desc}: expected ${show(expected)}, got ${show(found)}`);
     }
   }
   const importProblem = checkImportHasNoSideEffects();
@@ -270,13 +306,15 @@ const main = () => {
   const argv = process.argv.slice(2);
   if (argv.includes('--self-test')) runSelfTest();
 
+  const json = argv.includes('--json');
   const files = argv.filter((f) => f.endsWith('.sql'));
   if (files.length === 0) {
-    console.log('check-migration-safety: no .sql files to check, clean.');
+    console.log(json ? '{}' : 'check-migration-safety: no .sql files to check, clean.');
     process.exit(0);
   }
 
   const findings = new Set();
+  const byFile = {};
   for (const file of files) {
     let raw;
     try {
@@ -285,7 +323,16 @@ const main = () => {
       console.error(`check-migration-safety: cannot read ${file}: ${e.message}`);
       process.exit(1);
     }
-    for (const name of scanSql(stripComments(raw))) findings.add(`${file}: ${name}`);
+    const names = scanSql(raw);
+    byFile[file] = [...names].sort();
+    for (const name of names) findings.add(`${file}: ${name}`);
+  }
+
+  // Sorted, stable output so CI can diff it against a checked-in list.
+  if (json) {
+    console.log(JSON.stringify(byFile, null, 2));
+    process.exitCode = findings.size ? 1 : 0;
+    return;
   }
 
   if (findings.size) {
