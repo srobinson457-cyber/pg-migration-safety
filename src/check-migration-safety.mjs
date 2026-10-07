@@ -47,6 +47,11 @@
 //     ... NOT NULL without DEFAULT / DROP POLICY (exempt when the same policy on
 //     the same table is recreated in the SAME single-transaction file, which is
 //     the dominant legitimate alter-policy pattern; a naked drop still flags).
+//   - Comment stripping is quote-aware (2026-10): a '/*' or '--' inside a
+//     string, an E'' string, a quoted identifier or a dollar-quoted body is
+//     text, so it cannot hide the statements after it. Block comments nest, as
+//     in Postgres. `UPDATE t * SET` and quoted table names containing spaces
+//     reach the WHERE check.
 //
 // Bias: FALSE POSITIVES are SAFE (they just route to a human). FALSE NEGATIVES
 // are the danger, so the rules deliberately over-flag rather than under-flag,
@@ -57,9 +62,78 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-// Drop SQL comments so a comment mentioning "DROP TABLE" can't false-flag.
-const stripComments = (sql) =>
-  sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
+// Postgres identifier characters: ASCII letters, digits, _ and $, and any
+// non-ASCII character. A dollar-quote tag is the same without $ and never
+// starts with a digit, so $1 is a parameter, not a quote.
+const IDENT_CHAR = /[\w$]|[^\x00-\x7f]/;
+const DOLLAR_QUOTE = /\$(?:(?:[a-z_]|[^\x00-\x7f])(?:\w|[^\x00-\x7f])*)?\$/iy;
+// String contents up to the closing quote. A doubled '' needs no case of its
+// own in a plain string: 'it''s' scans as two adjacent strings with the same
+// boundaries. In an E'' string, \ escapes the next character, and '' must not
+// end it either, or the second half would scan as a plain string.
+const PLAIN_BODY = /[^']*/y;
+const E_BODY = /(?:\\[\s\S]|''|[^\\'])*/y;
+
+// Index of `needle` in `s` at or after `from`, or the end of `s` if absent.
+const indexOrEnd = (s, needle, from) => {
+  const j = s.indexOf(needle, from);
+  return j < 0 ? s.length : j;
+};
+
+// Drop SQL comments so a comment mentioning "DROP TABLE" can't false-flag and a
+// WHERE in a comment can't count. Comments are found the way Postgres's lexer
+// finds them: a '/*' or '--' inside a string, a quoted identifier or a
+// dollar-quoted body is text, so it can never swallow the statements after it.
+// String and dollar-quoted contents are kept, since they can be code that runs
+// (function and DO bodies, EXECUTE strings), and comments inside them are
+// stripped too, but only up to their own closing quote. A comment or quote left
+// open runs to the end of the text. Assumes standard_conforming_strings = on
+// (the Postgres default since 9.1), so a backslash escapes only in E'' strings.
+const stripComments = (sql) => {
+  let out = '';
+  for (let i = 0; i < sql.length; ) {
+    const c = sql[i];
+    DOLLAR_QUOTE.lastIndex = i;
+    const dollar = c === '$' && DOLLAR_QUOTE.exec(sql);
+    if (sql.startsWith('--', i)) {
+      i = indexOrEnd(sql, '\n', i);
+      out += ' ';
+    } else if (sql.startsWith('/*', i)) {
+      // Block comments nest: /* a /* b */ c */ is one comment.
+      let depth = 1;
+      for (i += 2; depth > 0 && i < sql.length; ) {
+        if (sql.startsWith('*/', i)) { depth--; i += 2; }
+        else if (sql.startsWith('/*', i)) { depth++; i += 2; }
+        else i++;
+      }
+      out += ' ';
+    } else if (c === "'") {
+      // E'' only when the E starts a word: in `like ... escape'\'` the e ends
+      // a keyword, and '\' is a plain one-character string.
+      const isE = /e/i.test(sql[i - 1] ?? '') && !IDENT_CHAR.test(sql[i - 2] ?? '');
+      const re = isE ? E_BODY : PLAIN_BODY;
+      re.lastIndex = i + 1;
+      const body = re.exec(sql)[0];
+      out += `'${stripComments(body)}'`;
+      i += body.length + 2;
+    } else if (c === '"') {
+      // A quoted identifier is a name, not code: kept as is.
+      const end = indexOrEnd(sql, '"', i + 1) + 1;
+      out += sql.slice(i, end);
+      i = end;
+    } else if (dollar) {
+      // $$...$$ or $tag$...$tag$: the body ends only at the same tag.
+      const tag = dollar[0];
+      const body = sql.slice(i + tag.length, indexOrEnd(sql, tag, i + tag.length));
+      out += tag + stripComments(body) + tag;
+      i += body.length + tag.length * 2;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+};
 
 // Per-statement rules (statements are split on ';'). Unanchored on purpose.
 const STMT_RULES = [
@@ -169,8 +243,10 @@ export const scanSql = (rawSql) => {
         findings.add('unqualified DELETE (no WHERE)');
       }
     }
-    // The table may carry an alias, with or without AS, before SET.
-    const updRe = /\bupdate\s+(?:only\s+)?[a-z0-9_."]+(?:\s+(?:as\s+)?[a-z0-9_"]+)?\s+set\b/gi;
+    // The table may carry an alias, with or without AS, before SET. A quoted
+    // name part may contain spaces, and `UPDATE t * SET` (the explicit
+    // inheritance marker) is the same statement as `UPDATE t SET`.
+    const updRe = /\bupdate\s+(?:only\s+)?(?:"[^"]*"|[a-z0-9_.])+(?:\s*\*)?(?:\s+(?:as\s+)?[a-z0-9_"]+)?\s+set\b/gi;
     for (let m; (m = updRe.exec(s)); ) {
       if (!hasTopLevelWhere(groupSpan(s, m.index))) {
         findings.add('unqualified UPDATE (no WHERE)');
@@ -220,6 +296,8 @@ const SELF_TEST_CASES = [
   ['UPDATE with an AS alias, no WHERE', `update public.accounts as a set tier = 1`, [UPD]],
   ['UPDATE with a quoted alias, no WHERE', `update public.accounts "A" set tier = 1`, [UPD]],
   ['UPDATE with a table alias and WHERE', `update public.accounts a set tier = 1 where a.id = 2`, []],
+  ['UPDATE t * (explicit inheritance marker), no WHERE', `update public.accounts * set tier = 1`, [UPD]],
+  ['UPDATE on a quoted table name containing a space, with an alias, no WHERE', `update public."audit log" a set archived = true`, [UPD]],
   ['DELETE whose only "where" is in a trailing comment', `delete from public.audit_log -- purge everything where possible`, [DEL]],
   ['DELETE whose only WHERE is inside a USING subquery', `delete from a using (select id from b where x = 1) s`, [DEL]],
   ['EXECUTE format dynamic DELETE without WHERE', `do $$ begin execute format('delete from %I', t); end $$`, [DEL]],
@@ -240,6 +318,23 @@ const SELF_TEST_CASES = [
   ['ADD COLUMN nullable', `alter table families add column note text`, []],
   ['DROP TABLE mentioned only in a line comment', `-- we deliberately do NOT drop table stars\ncreate table foo (id uuid primary key)`, []],
   ['DROP TABLE mentioned only in a block comment', `/* drop table public.accounts was considered and rejected */\ncreate table foo (id uuid primary key)`, []],
+  // A comment marker inside quotes is text, not a comment, and must not hide
+  // the statements after it.
+  ["DELETE after a string containing /* and a doubled '' quote", `insert into public.notes (body) values ('it''s /* not a comment'); delete from public.stars; /* tidy up */`, [DEL]],
+  ['DELETE after a string containing --', `insert into public.notes (body) values ('--'); delete from public.stars`, [DEL]],
+  ['DELETE after an E-string with a backslash-escaped quote and /*', `insert into public.notes (body) values (E'it\\'s /* not a comment'); delete from public.stars; /* tidy up */`, [DEL]],
+  ["DELETE after an E-string using both '' and backslash quote escapes", `insert into public.notes (body) values (E'O''Brien\\'s /* draft'); delete from public.stars; /* tidy up */`, [DEL]],
+  ["a keyword ending in e before a quote (escape'...') does not start an E-string", `select 1 where 'a' like 'a' escape'\\'; insert into public.notes (body) values ('-- cleared'); delete from public.stars`, [DEL]],
+  ['DELETE after a quoted identifier containing /*', `insert into public."odd /* name" (id) values (1); delete from public.stars; /* tidy up */`, [DEL]],
+  ['DROP TABLE after a dollar-quoted function body containing /*', `create function public.strip_c_comment(src text) returns text language plpython3u as $$\n# keep only the text before the first /*\nreturn src.split('/*')[0]\n$$;\ndrop table public.legacy_imports;\n/* end of migration */`, ['DROP TABLE']],
+  ['DROP TABLE after a $tag$ body ending in a -- comment', `create function public.noop() returns void language sql as $fn$ select 1 -- placeholder $fn$; drop table public.legacy_imports`, ['DROP TABLE']],
+  // Quoted contents can be code that runs, so their own comments still go.
+  ['commented-out WHERE inside a DO body does not count', `do $$ begin delete from public.audit_log /* where id < 100 */; end $$`, [DEL]],
+  ['commented-out WHERE inside a single-quoted function body does not count', `create function public.purge() returns void language sql as 'delete from public.audit_log /* where id < 100 */'`, [DEL]],
+  // Block comments nest in Postgres, and a /* inside a line comment opens nothing.
+  ['DELETE inside a nested block comment', `/* disabled for now:\n   /* original: */ delete from public.audit_log;\n*/\nselect 1`, []],
+  ['WHERE inside a nested block comment does not count', `delete from public.audit_log /* outer /* inner */ where id = 1 */`, [DEL]],
+  ['a /* inside a line comment opens no block comment', `-- a /* in a line comment opens nothing\ndelete from public.stars;\n/* end of migration */`, [DEL]],
   ['plain additive migration', `create table foo (id uuid primary key);\ncreate index foo_idx on foo (id);\ncreate policy p on foo for select using (true)`, []],
   ['non-concurrent index on pre-existing table', `create index stars_idx on public.stars (family_id)`, ['non-CONCURRENT CREATE INDEX on existing table "stars" (locks prod)']],
   ['CONCURRENT index on pre-existing table', `create index concurrently i on public.existing (c)`, []],
