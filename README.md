@@ -2,7 +2,7 @@
 
 A CI gate that catches destructive SQL migrations **your migration tests cannot see**.
 
-Zero dependencies. One file. 44 self-tests, and a mutation check that removes each rule in turn
+Zero dependencies. One file. 59 self-tests, and a mutation check that removes each rule in turn
 and requires a test to fail.
 
 Extracted in September 2026 from private code I run in production, built agent-first with Claude
@@ -98,9 +98,22 @@ The scan walks balanced pairs and stops only at a `)` that closes an *enclosing*
 that span, only a `WHERE` at the top level counts; a `WHERE` nested inside a subquery is the
 subquery's, not the statement's.
 
-**Comments are stripped first**, inside `scanSql` itself, so a comment mentioning `DROP TABLE`
-cannot false-flag and a `where` in a comment cannot satisfy the `WHERE` check, while a
-`DROP TABLE` inside a string literal still flags.
+**Comments are found the way Postgres finds them**, inside `scanSql` itself, so a comment
+mentioning `DROP TABLE` cannot false-flag and a `where` in a comment cannot satisfy the `WHERE`
+check. A `/*` or `--` inside a string, a quoted identifier or a dollar-quoted body is text, not a
+comment, so it cannot hide the statements after it:
+
+```sql
+-- must flag: the /* is inside a string, and the DELETE after it is real
+insert into public.notes (body) values ('use /* for comments');
+delete from public.audit_log;
+/* end of migration */
+```
+
+String and dollar-quoted contents are still scanned, because function bodies, `DO` blocks and
+`EXECUTE` strings are code that runs. So a `DROP TABLE` inside a string literal still flags, and
+a commented-out `WHERE` inside a function body still does not count. Block comments nest, as
+they do in Postgres.
 
 ---
 
@@ -174,7 +187,7 @@ calls `process.exit` inside your process.
 **Try it.**
 
 ```bash
-npm run test          # 44 self-test cases
+npm run test          # 59 self-test cases
 npm run test:mutation # breaks each rule in turn; every break must fail the self-test
 npm run demo:safe     # exits 0
 npm run demo:unsafe   # exits 1, lists six findings
